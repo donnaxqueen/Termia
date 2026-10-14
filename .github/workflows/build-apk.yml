@@ -1,92 +1,848 @@
-name: Build Termia APK
+name: Compilar APK de Termia
 
 on:
+  push:
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
+  apk:
     runs-on: ubuntu-latest
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Prepare Android SDK
+      - name: Extraer la aplicación web del ZIP
         shell: bash
         run: |
           set -euo pipefail
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
-            echo "No se encontró sdkmanager en el Android SDK preinstalado."
-            find "$ANDROID_HOME" -maxdepth 4 -type f -name sdkmanager -print | head -20 || true
-            exit 1
-          fi
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Extract web project from ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          ZIP="termia-proyecto.zip"
-          test -f "$ZIP" || { echo "No se encontró $ZIP en la raíz del repositorio."; exit 1; }
+          test -f termia-proyecto.zip || { echo "No se encontró termia-proyecto.zip en la raíz del repositorio."; exit 1; }
           mkdir -p extracted
-          unzip -q "$ZIP" -d extracted
+          unzip -q termia-proyecto.zip -d extracted
           WEB_DIR="$(find extracted -type d -name www -print -quit)"
           if [ -z "$WEB_DIR" ]; then
             INDEX_FILE="$(find extracted -type f -name index.html -print -quit)"
             if [ -z "$INDEX_FILE" ]; then
-              echo "El ZIP no contiene una carpeta www ni index.html."
-              find extracted -maxdepth 5 -type f | head -150
+              echo "El ZIP no contiene www ni index.html."
+              find extracted -maxdepth 5 -type f | head -100
               exit 1
             fi
             WEB_DIR="$(dirname "$INDEX_FILE")"
           fi
-          mkdir -p app/www
-          cp -R "$WEB_DIR"/. app/www/
+          mkdir -p www
+          cp -R "$WEB_DIR"/. www/
+          test -f www/index.html || { echo "No se encontró www/index.html después de extraer el ZIP."; exit 1; }
           echo "Archivos web preparados:"
-          find app/www -maxdepth 3 -type f | head -80
+          find www -maxdepth 3 -type f | head -80
 
-      - name: Create Capacitor Android wrapper
-        working-directory: app
-        shell: bash
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Crear proyecto Android
         run: |
-          set -euo pipefail
-          npm init -y
-          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
-          cat > capacitor.config.json <<'EOF'
+          set -e
+          cat > package.json <<'EOF_PKG'
           {
-            "appId": "com.donnaxqueen.termia",
-            "appName": "Termia",
-            "webDir": "www"
+            "name": "termia",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/core": "^7.0.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^7.0.0"
+            }
           }
-          EOF
+          EOF_PKG
+          cat > capacitor.config.json <<'EOF_CFG'
+          {
+            "appId": "com.termia.app",
+            "appName": "Termia",
+            "webDir": "www",
+            "backgroundColor": "#0b0420"
+          }
+          EOF_CFG
+          npm install
           npx cap add android
+
+      - name: Agregar el plugin de Termia
+        run: |
+          set -e
+          DIR=android/app/src/main/java/com/termia/app
+          mkdir -p "$DIR"
+          cat > "$DIR/TermiaPlugin.java" <<'EOF_JAVA'
+          package com.termia.app;
+
+          import android.content.ContentResolver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.SharedPreferences;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.net.nsd.NsdManager;
+          import android.net.nsd.NsdServiceInfo;
+          import android.net.wifi.WifiManager;
+          import android.os.BatteryManager;
+          import android.os.Build;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import android.app.ActivityManager;
+
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.Inet4Address;
+          import java.net.InetAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.net.URL;
+          import java.security.SecureRandom;
+          import java.util.HashMap;
+          import java.util.LinkedList;
+          import java.util.Map;
+
+          /**
+           * Plugin nativo de Termia: lectura de bateria, enfriado forzado y enlace por WiFi local.
+           * Las funciones de red funcionan mientras la app esta abierta.
+           */
+          @CapacitorPlugin(name = "Termia")
+          public class TermiaPlugin extends Plugin {
+
+              private static final String SERVICE_TYPE = "_termia._tcp.";
+
+              private volatile String deviceId = "";
+              private volatile String deviceName = "Mi celular";
+              private volatile boolean allowRemoteCool = false;
+              private volatile double resistance = -1;
+
+              private final Map<String, String> peerTokens = new HashMap<>(); // token -> deviceId
+
+              private volatile String pairCode = null;
+              private volatile long pairExpires = 0;
+              private volatile int pairFails = 0;
+
+              private ServerSocket server;
+              private NsdManager nsd;
+              private NsdManager.RegistrationListener regListener;
+              private NsdManager.DiscoveryListener discListener;
+              private final LinkedList<NsdServiceInfo> resolveQueue = new LinkedList<>();
+              private boolean resolving = false;
+
+              // ------------------------------------------------------------------
+              // Bateria
+              // ------------------------------------------------------------------
+
+              private JSObject readBattery() {
+                  Context ctx = getContext();
+                  JSObject o = new JSObject();
+                  Intent i = ctx.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+                  if (i == null) return o;
+
+                  int temp = i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
+                  int volt = i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
+                  int level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                  int scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                  int status = i.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN);
+                  int plugged = i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+                  int cycles = i.getIntExtra("android.os.extra.CYCLE_COUNT", -1);
+
+                  if (temp != Integer.MIN_VALUE) o.put("temp", temp / 10.0);
+                  if (volt > 0) o.put("voltage", volt / 1000.0);
+                  if (level >= 0 && scale > 0) o.put("level", Math.round(level * 100.0 / scale));
+                  o.put("status", status);
+                  o.put("plugged", plugged);
+                  o.put("charging", status == BatteryManager.BATTERY_STATUS_CHARGING);
+                  o.put("full", status == BatteryManager.BATTERY_STATUS_FULL);
+                  o.put("cycles", cycles);
+
+                  int soh = -1;
+                  double curMa = 0;
+                  BatteryManager bm = (BatteryManager) ctx.getSystemService(Context.BATTERY_SERVICE);
+                  if (bm != null) {
+                      try {
+                          long ua = bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW);
+                          if (ua != Long.MIN_VALUE) curMa = ua / 1000.0;
+                      } catch (Throwable t) { /* sin dato */ }
+                      if (Build.VERSION.SDK_INT >= 34) {
+                          try {
+                              int v = bm.getIntProperty(10); // BATTERY_PROPERTY_STATE_OF_HEALTH
+                              if (v > 0 && v <= 100) soh = v;
+                          } catch (Throwable t) { /* no disponible */ }
+                      }
+                  }
+                  // El signo de la corriente cambia segun el fabricante: se normaliza con el estado.
+                  boolean charging = status == BatteryManager.BATTERY_STATUS_CHARGING;
+                  if (charging && curMa < 0) curMa = -curMa;
+                  if (plugged == 0 && curMa > 0) curMa = -curMa;
+                  o.put("currentMa", curMa);
+                  o.put("soh", soh);
+
+                  boolean screenOn = true;
+                  try {
+                      PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+                      if (pm != null) screenOn = pm.isInteractive();
+                  } catch (Throwable t) { /* ignorar */ }
+                  o.put("screenOn", screenOn);
+
+                  int br = 128;
+                  try {
+                      br = Settings.System.getInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 128);
+                  } catch (Throwable t) { /* ignorar */ }
+                  o.put("brightness", br);
+
+                  boolean wifiOn = true;
+                  try {
+                      WifiManager wm = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                      if (wm != null) wifiOn = wm.isWifiEnabled();
+                  } catch (Throwable t) { /* ignorar */ }
+                  o.put("wifiOn", wifiOn);
+                  return o;
+              }
+
+              // ------------------------------------------------------------------
+              // Enfriado forzado
+              // ------------------------------------------------------------------
+
+              private JSObject doCool() {
+                  Context ctx = getContext();
+                  ContentResolver cr = ctx.getContentResolver();
+                  SharedPreferences sp = ctx.getSharedPreferences("termia", Context.MODE_PRIVATE);
+                  boolean brightnessOk = false;
+                  boolean needsWrite = false;
+                  boolean saverOk = false;
+                  int apps = 0;
+
+                  try {
+                      if (Settings.System.canWrite(ctx)) {
+                          if (!sp.contains("origBrightness")) {
+                              int ob = Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS, 128);
+                              int om = Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, 0);
+                              sp.edit().putInt("origBrightness", ob).putInt("origMode", om).apply();
+                          }
+                          Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE,
+                                  Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL);
+                          Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, 1);
+                          brightnessOk = true;
+                      } else {
+                          needsWrite = true;
+                      }
+                  } catch (Throwable t) { /* sin permiso */ }
+
+                  try {
+                      int cur = Settings.Global.getInt(cr, "low_power", 0);
+                      Settings.Global.putInt(cr, "low_power", 1);
+                      if (cur == 0) sp.edit().putBoolean("saverSetByUs", true).apply();
+                      saverOk = true;
+                  } catch (Throwable t) { /* requiere WRITE_SECURE_SETTINGS dado por adb */ }
+
+                  try {
+                      ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+                      PackageManager pm = ctx.getPackageManager();
+                      for (ApplicationInfo ai : pm.getInstalledApplications(0)) {
+                          if ((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0) continue;
+                          if (ai.packageName.equals(ctx.getPackageName())) continue;
+                          am.killBackgroundProcesses(ai.packageName);
+                          apps++;
+                      }
+                  } catch (Throwable t) { /* ignorar */ }
+
+                  JSObject res = new JSObject();
+                  res.put("brightness", brightnessOk);
+                  res.put("needsWriteSettings", needsWrite);
+                  res.put("saver", saverOk);
+                  res.put("apps", apps);
+                  return res;
+              }
+
+              private void doRestore() {
+                  Context ctx = getContext();
+                  ContentResolver cr = ctx.getContentResolver();
+                  SharedPreferences sp = ctx.getSharedPreferences("termia", Context.MODE_PRIVATE);
+                  try {
+                      if (sp.contains("origBrightness") && Settings.System.canWrite(ctx)) {
+                          Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, sp.getInt("origMode", 0));
+                          Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, sp.getInt("origBrightness", 128));
+                          sp.edit().remove("origBrightness").remove("origMode").apply();
+                      }
+                  } catch (Throwable t) { /* ignorar */ }
+                  try {
+                      if (sp.getBoolean("saverSetByUs", false)) {
+                          Settings.Global.putInt(cr, "low_power", 0);
+                          sp.edit().remove("saverSetByUs").apply();
+                      }
+                  } catch (Throwable t) { /* ignorar */ }
+              }
+
+              // ------------------------------------------------------------------
+              // Metodos expuestos a la web
+              // ------------------------------------------------------------------
+
+              @PluginMethod
+              public void getBattery(PluginCall call) {
+                  call.resolve(readBattery());
+              }
+
+              @PluginMethod
+              public void coolDown(final PluginCall call) {
+                  new Thread(new Runnable() {
+                      public void run() { call.resolve(doCool()); }
+                  }).start();
+              }
+
+              @PluginMethod
+              public void restoreCool(PluginCall call) {
+                  doRestore();
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void openWriteSettings(PluginCall call) {
+                  try {
+                      Intent it = new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,
+                              Uri.parse("package:" + getContext().getPackageName()));
+                      it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(it);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("No se pudo abrir los ajustes");
+                  }
+              }
+
+              private void applyConfig(PluginCall call) {
+                  String id = call.getString("deviceId");
+                  if (id != null) deviceId = id;
+                  String name = call.getString("name");
+                  if (name != null) deviceName = name;
+                  Boolean allow = call.getBoolean("allowRemoteCool");
+                  if (allow != null) allowRemoteCool = allow;
+                  Double r = call.getDouble("r");
+                  if (r != null) resistance = r;
+                  JSArray peers = call.getArray("peers");
+                  if (peers != null) {
+                      synchronized (peerTokens) {
+                          peerTokens.clear();
+                          for (int k = 0; k < peers.length(); k++) {
+                              try {
+                                  JSONObject p = peers.getJSONObject(k);
+                                  peerTokens.put(p.getString("token"), p.getString("deviceId"));
+                              } catch (Exception e) { /* ignorar entrada invalida */ }
+                          }
+                      }
+                  }
+              }
+
+              @PluginMethod
+              public void configure(PluginCall call) {
+                  applyConfig(call);
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void start(PluginCall call) {
+                  applyConfig(call);
+                  try {
+                      if (server == null) {
+                          startServer();
+                      }
+                      call.resolve(new JSObject().put("port", server.getLocalPort()));
+                  } catch (Exception e) {
+                      call.reject("No se pudo iniciar la red: " + e.getMessage());
+                  }
+              }
+
+              @PluginMethod
+              public void rescan(PluginCall call) {
+                  stopDiscovery();
+                  new Thread(new Runnable() {
+                      public void run() {
+                          try { Thread.sleep(600); } catch (InterruptedException e) { /* ignorar */ }
+                          startDiscovery();
+                      }
+                  }).start();
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void setPairCode(PluginCall call) {
+                  pairCode = call.getString("code");
+                  pairExpires = System.currentTimeMillis() + 5 * 60 * 1000L;
+                  pairFails = 0;
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void clearPairCode(PluginCall call) {
+                  pairCode = null;
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void pairWith(final PluginCall call) {
+                  final String host = call.getString("host");
+                  final int port = call.getInt("port", 0);
+                  final String code = call.getString("code");
+                  new Thread(new Runnable() {
+                      public void run() {
+                          try {
+                              JSONObject b = new JSONObject();
+                              b.put("code", code);
+                              b.put("deviceId", deviceId);
+                              b.put("name", deviceName);
+                              call.resolve(toJS(http("POST", host, port, "/pair", null, b.toString())));
+                          } catch (Exception e) {
+                              call.reject("No se pudo conectar: " + e.getMessage());
+                          }
+                      }
+                  }).start();
+              }
+
+              @PluginMethod
+              public void fetchStatus(final PluginCall call) {
+                  final String host = call.getString("host");
+                  final int port = call.getInt("port", 0);
+                  final String token = call.getString("token");
+                  new Thread(new Runnable() {
+                      public void run() {
+                          try {
+                              call.resolve(toJS(http("GET", host, port, "/status", token, null)));
+                          } catch (Exception e) {
+                              call.reject("Sin respuesta");
+                          }
+                      }
+                  }).start();
+              }
+
+              @PluginMethod
+              public void requestCool(final PluginCall call) {
+                  final String host = call.getString("host");
+                  final int port = call.getInt("port", 0);
+                  final String token = call.getString("token");
+                  new Thread(new Runnable() {
+                      public void run() {
+                          try {
+                              call.resolve(toJS(http("POST", host, port, "/cool", token, "{}")));
+                          } catch (Exception e) {
+                              call.reject("Sin respuesta");
+                          }
+                      }
+                  }).start();
+              }
+
+              @Override
+              protected void handleOnDestroy() {
+                  stopDiscovery();
+                  try {
+                      if (nsd != null && regListener != null) nsd.unregisterService(regListener);
+                  } catch (Exception e) { /* ignorar */ }
+                  try {
+                      if (server != null) server.close();
+                  } catch (Exception e) { /* ignorar */ }
+                  server = null;
+              }
+
+              // ------------------------------------------------------------------
+              // Servidor HTTP minimo (solo red local)
+              // ------------------------------------------------------------------
+
+              private void startServer() throws Exception {
+                  server = new ServerSocket(0);
+                  final ServerSocket ss = server;
+                  Thread t = new Thread(new Runnable() {
+                      public void run() {
+                          while (!ss.isClosed()) {
+                              try {
+                                  final Socket s = ss.accept();
+                                  new Thread(new Runnable() {
+                                      public void run() { handleClient(s); }
+                                  }).start();
+                              } catch (Exception e) {
+                                  break;
+                              }
+                          }
+                      }
+                  });
+                  t.setDaemon(true);
+                  t.start();
+
+                  nsd = (NsdManager) getContext().getSystemService(Context.NSD_SERVICE);
+                  registerNsd(ss.getLocalPort());
+                  startDiscovery();
+              }
+
+              private String tokenOwner(String auth) {
+                  if (auth == null || !auth.startsWith("Bearer ")) return null;
+                  String token = auth.substring(7).trim();
+                  synchronized (peerTokens) {
+                      return peerTokens.get(token);
+                  }
+              }
+
+              private void handleClient(Socket s) {
+                  try {
+                      s.setSoTimeout(5000);
+                      BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+                      String line = r.readLine();
+                      if (line == null) return;
+                      String[] p = line.split(" ");
+                      if (p.length < 2) return;
+                      String method = p[0];
+                      String path = p[1];
+                      int len = 0;
+                      String auth = "";
+                      String h;
+                      while ((h = r.readLine()) != null && !h.isEmpty()) {
+                          String lower = h.toLowerCase();
+                          if (lower.startsWith("content-length:")) {
+                              len = Integer.parseInt(h.substring(15).trim());
+                          } else if (lower.startsWith("authorization:")) {
+                              auth = h.substring(14).trim();
+                          }
+                      }
+                      String body = "";
+                      if (len > 0 && len <= 2048) {
+                          char[] buf = new char[len];
+                          int got = 0;
+                          while (got < len) {
+                              int n = r.read(buf, got, len - got);
+                              if (n < 0) break;
+                              got += n;
+                          }
+                          body = new String(buf, 0, got);
+                      }
+
+                      int code = 404;
+                      JSONObject out = new JSONObject();
+                      if ("POST".equals(method) && "/pair".equals(path)) {
+                          code = handlePair(body, out);
+                      } else if ("GET".equals(method) && "/status".equals(path)) {
+                          if (tokenOwner(auth) == null) {
+                              code = 401;
+                              out.put("error", "unauthorized");
+                          } else {
+                              out = statusJson();
+                              code = 200;
+                          }
+                      } else if ("POST".equals(method) && "/cool".equals(path)) {
+                          String who = tokenOwner(auth);
+                          if (who == null) {
+                              code = 401;
+                              out.put("error", "unauthorized");
+                          } else if (!allowRemoteCool) {
+                              code = 403;
+                              out.put("error", "denied");
+                          } else {
+                              out = doCool();
+                              code = 200;
+                              JSObject ev = new JSObject();
+                              ev.put("deviceId", who);
+                              notifyListeners("remoteCool", ev);
+                          }
+                      }
+
+                      byte[] data = asciiJson(out.toString()).getBytes("UTF-8");
+                      String head = "HTTP/1.1 " + code + " OK\r\nContent-Type: application/json\r\nContent-Length: "
+                              + data.length + "\r\nConnection: close\r\n\r\n";
+                      OutputStream os = s.getOutputStream();
+                      os.write(head.getBytes("UTF-8"));
+                      os.write(data);
+                      os.flush();
+                  } catch (Exception e) {
+                      /* conexion rota: se ignora */
+                  } finally {
+                      try { s.close(); } catch (Exception e) { /* ignorar */ }
+                  }
+              }
+
+              private int handlePair(String body, JSONObject out) throws Exception {
+                  JSONObject b = new JSONObject(body);
+                  String code = b.optString("code");
+                  String pid = b.optString("deviceId");
+                  String pname = b.optString("name");
+                  if (pairCode == null || System.currentTimeMillis() > pairExpires || pid.isEmpty()) {
+                      out.put("error", "no_code");
+                      return 403;
+                  }
+                  if (!pairCode.equals(code)) {
+                      pairFails++;
+                      if (pairFails >= 5) pairCode = null;
+                      out.put("error", "bad_code");
+                      return 403;
+                  }
+                  String token = randomToken();
+                  synchronized (peerTokens) {
+                      peerTokens.put(token, pid);
+                  }
+                  pairCode = null;
+                  out.put("ok", true);
+                  out.put("token", token);
+                  out.put("deviceId", deviceId);
+                  out.put("name", deviceName);
+                  JSObject ev = new JSObject();
+                  ev.put("deviceId", pid);
+                  ev.put("name", pname);
+                  ev.put("token", token);
+                  notifyListeners("paired", ev);
+                  return 200;
+              }
+
+              private JSObject statusJson() {
+                  JSObject o = readBattery();
+                  o.put("deviceId", deviceId);
+                  o.put("name", deviceName);
+                  o.put("r", resistance);
+                  o.put("allowRemoteCool", allowRemoteCool);
+                  o.put("ts", System.currentTimeMillis());
+                  return o;
+              }
+
+              // ------------------------------------------------------------------
+              // Descubrimiento por mDNS (NSD)
+              // ------------------------------------------------------------------
+
+              private String idFrom(String serviceName) {
+                  if (serviceName == null || !serviceName.startsWith("Termia-")) return null;
+                  String rest = serviceName.substring(7);
+                  int sp = rest.indexOf(' ');
+                  if (sp > 0) rest = rest.substring(0, sp);
+                  return rest;
+              }
+
+              private void registerNsd(int port) {
+                  try {
+                      NsdServiceInfo info = new NsdServiceInfo();
+                      info.setServiceName("Termia-" + deviceId);
+                      info.setServiceType(SERVICE_TYPE);
+                      info.setPort(port);
+                      regListener = new NsdManager.RegistrationListener() {
+                          public void onRegistrationFailed(NsdServiceInfo s, int e) { }
+                          public void onUnregistrationFailed(NsdServiceInfo s, int e) { }
+                          public void onServiceRegistered(NsdServiceInfo s) { }
+                          public void onServiceUnregistered(NsdServiceInfo s) { }
+                      };
+                      nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, regListener);
+                  } catch (Exception e) { /* se reintenta al reabrir la app */ }
+              }
+
+              private void startDiscovery() {
+                  try {
+                      if (nsd == null) return;
+                      discListener = new NsdManager.DiscoveryListener() {
+                          public void onStartDiscoveryFailed(String t, int e) { }
+                          public void onStopDiscoveryFailed(String t, int e) { }
+                          public void onDiscoveryStarted(String t) { }
+                          public void onDiscoveryStopped(String t) { }
+                          public void onServiceFound(NsdServiceInfo s) {
+                              String id = idFrom(s.getServiceName());
+                              if (id == null || id.equals(deviceId)) return;
+                              enqueueResolve(s);
+                          }
+                          public void onServiceLost(NsdServiceInfo s) {
+                              String id = idFrom(s.getServiceName());
+                              if (id == null) return;
+                              JSObject o = new JSObject();
+                              o.put("deviceId", id);
+                              notifyListeners("peerLost", o);
+                          }
+                      };
+                      nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discListener);
+                  } catch (Exception e) { /* ignorar */ }
+              }
+
+              private void stopDiscovery() {
+                  try {
+                      if (nsd != null && discListener != null) nsd.stopServiceDiscovery(discListener);
+                  } catch (Exception e) { /* ignorar */ }
+                  discListener = null;
+              }
+
+              private void enqueueResolve(NsdServiceInfo s) {
+                  synchronized (resolveQueue) {
+                      resolveQueue.add(s);
+                  }
+                  nextResolve();
+              }
+
+              private void nextResolve() {
+                  final NsdServiceInfo s;
+                  synchronized (resolveQueue) {
+                      if (resolving || resolveQueue.isEmpty()) return;
+                      s = resolveQueue.poll();
+                      resolving = true;
+                  }
+                  try {
+                      nsd.resolveService(s, new NsdManager.ResolveListener() {
+                          public void onResolveFailed(NsdServiceInfo i, int e) {
+                              finishResolve();
+                          }
+                          public void onServiceResolved(NsdServiceInfo i) {
+                              try {
+                                  InetAddress host = i.getHost();
+                                  String id = idFrom(i.getServiceName());
+                                  if (host instanceof Inet4Address && id != null) {
+                                      JSObject o = new JSObject();
+                                      o.put("deviceId", id);
+                                      o.put("host", host.getHostAddress());
+                                      o.put("port", i.getPort());
+                                      notifyListeners("peer", o);
+                                  }
+                              } catch (Exception e) { /* ignorar */ }
+                              finishResolve();
+                          }
+                      });
+                  } catch (Exception e) {
+                      finishResolve();
+                  }
+              }
+
+              private void finishResolve() {
+                  synchronized (resolveQueue) {
+                      resolving = false;
+                  }
+                  nextResolve();
+              }
+
+              // ------------------------------------------------------------------
+              // Utilidades HTTP
+              // ------------------------------------------------------------------
+
+              private JSONObject http(String method, String host, int port, String path, String token, String body)
+                      throws Exception {
+                  URL u = new URL("http://" + host + ":" + port + path);
+                  HttpURLConnection c = (HttpURLConnection) u.openConnection();
+                  try {
+                      c.setConnectTimeout(3000);
+                      c.setReadTimeout(5000);
+                      c.setRequestMethod(method);
+                      if (token != null) c.setRequestProperty("Authorization", "Bearer " + token);
+                      if (body != null) {
+                          byte[] d = asciiJson(body).getBytes("UTF-8");
+                          c.setDoOutput(true);
+                          c.setRequestProperty("Content-Type", "application/json");
+                          c.setFixedLengthStreamingMode(d.length);
+                          OutputStream os = c.getOutputStream();
+                          os.write(d);
+                          os.flush();
+                      }
+                      int code = c.getResponseCode();
+                      InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
+                      String text = is == null ? "" : readAll(is);
+                      JSONObject j;
+                      try {
+                          j = new JSONObject(text);
+                      } catch (Exception e) {
+                          j = new JSONObject();
+                      }
+                      j.put("httpCode", code);
+                      return j;
+                  } finally {
+                      c.disconnect();
+                  }
+              }
+
+              private JSObject toJS(JSONObject j) throws Exception {
+                  return new JSObject(j.toString());
+              }
+
+              private String readAll(InputStream is) throws Exception {
+                  BufferedReader r = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+                  StringBuilder sb = new StringBuilder();
+                  String l;
+                  while ((l = r.readLine()) != null) sb.append(l);
+                  return sb.toString();
+              }
+
+              private String asciiJson(String s) {
+                  StringBuilder sb = new StringBuilder();
+                  for (int k = 0; k < s.length(); k++) {
+                      char ch = s.charAt(k);
+                      if (ch > 127) sb.append(String.format("\\u%04x", (int) ch));
+                      else sb.append(ch);
+                  }
+                  return sb.toString();
+              }
+
+              private String randomToken() {
+                  byte[] b = new byte[16];
+                  new SecureRandom().nextBytes(b);
+                  StringBuilder sb = new StringBuilder();
+                  for (byte x : b) sb.append(String.format("%02x", x));
+                  return sb.toString();
+              }
+          }
+
+          EOF_JAVA
+          cat > "$DIR/MainActivity.java" <<'EOF_MAIN'
+          package com.termia.app;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(TermiaPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          EOF_MAIN
+          python3 - <<'EOF_PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          perms = """    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+              <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+          """
+          if 'WRITE_SETTINGS' not in s:
+              s = s.replace('</manifest>', perms + '</manifest>')
+          s = s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print(s)
+          EOF_PY
+
+      - name: Sincronizar y compilar
+        run: |
+          set -e
           npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
 
-      - name: Build debug APK
-        working-directory: app/android
-        run: ./gradlew assembleDebug --no-daemon
-
-      - name: Upload APK
+      - name: Guardar el APK
         uses: actions/upload-artifact@v4
         with:
-          name: termia-debug-apk
-          path: app/android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          name: termia-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publicar el APK para descargar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk termia.apk
+          gh release delete apk --yes --cleanup-tag || true
+          gh release create apk termia.apk --title "Termia (APK)" --notes "APK listo para instalar en Android." --target "${{ github.sha }}"
