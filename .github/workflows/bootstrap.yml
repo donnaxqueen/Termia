@@ -1,8 +1,6 @@
 name: Bootstrap Termia
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -17,7 +15,6 @@ jobs:
         run: |
           set -e
           base64 -d termia-source.b64 > termia-source.zip
-          rm -rf .github/workflows/build-apk.yml www LEEME.md
           unzip -o termia-source.zip
           rm -f termia-source.zip termia-source.b64
           git config user.name "github-actions[bot]"
