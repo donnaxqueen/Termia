@@ -13,50 +13,68 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify and extract project ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          ZIP="termia-proyecto.zip"
-          test -f "$ZIP" || { echo "No se encontró $ZIP en la raíz del repositorio."; exit 1; }
-          mkdir -p source
-          unzip -q "$ZIP" -d source
-          echo "Contenido extraído:"
-          find source -maxdepth 3 -type f \( -name 'gradlew' -o -name 'settings.gradle' -o -name 'settings.gradle.kts' -o -name 'build.gradle' -o -name 'build.gradle.kts' -o -name 'package.json' \) -print | head -80
-
-      - name: Locate Android Gradle project
-        id: project
-        shell: bash
-        run: |
-          set -euo pipefail
-          WRAPPER="$(find source -type f -name gradlew -print -quit)"
-          if [ -z "$WRAPPER" ]; then
-            echo "No se encontró gradlew dentro de termia-proyecto.zip."
-            echo "El ZIP podría no contener un proyecto Android/Gradle listo para compilar."
-            find source -maxdepth 4 -type f | head -150
-            exit 1
-          fi
-          PROJECT_DIR="$(dirname "$WRAPPER")"
-          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          chmod +x "$WRAPPER"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Extract web project from ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="termia-proyecto.zip"
+          test -f "$ZIP" || { echo "No se encontró $ZIP en la raíz del repositorio."; exit 1; }
+          mkdir -p extracted
+          unzip -q "$ZIP" -d extracted
+          WEB_DIR="$(find extracted -type d -name www -print -quit)"
+          if [ -z "$WEB_DIR" ]; then
+            INDEX_FILE="$(find extracted -type f -name index.html -print -quit)"
+            if [ -z "$INDEX_FILE" ]; then
+              echo "El ZIP no contiene una carpeta www ni index.html."
+              find extracted -maxdepth 5 -type f | head -150
+              exit 1
+            fi
+            WEB_DIR="$(dirname "$INDEX_FILE")"
+          fi
+          mkdir -p app/www
+          cp -R "$WEB_DIR"/. app/www/
+          echo "Archivos web preparados:"
+          find app/www -maxdepth 3 -type f | head -80
+
+      - name: Create Capacitor Android wrapper
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.donnaxqueen.termia",
+            "appName": "Termia",
+            "webDir": "www"
+          }
+          EOF
+          npx cap add android
+          npx cap sync android
 
       - name: Build debug APK
-        working-directory: ${{ steps.project.outputs.dir }}
+        working-directory: app/android
         run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: termia-debug-apk
-          path: |
-            **/build/outputs/apk/debug/*.apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
